@@ -18,7 +18,7 @@
 
 package org.apache.flink.client.cli;
 
-import org.apache.flink.client.deployment.executors.StandaloneSessionClusterExecutor;
+import org.apache.flink.client.deployment.executors.RemoteExecutor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.HighAvailabilityOptions;
@@ -49,7 +49,7 @@ public abstract class AbstractCustomCommandLine implements CustomCommandLine {
 
 
 	protected final Option addressOption = new Option("m", "jobmanager", true,
-		"Address of the JobManager (master) to which to connect. " +
+		"Address of the JobManager to which to connect. " +
 			"Use this flag to connect to a different JobManager than the one specified in the configuration.");
 
 	protected final Configuration configuration;
@@ -76,7 +76,7 @@ public abstract class AbstractCustomCommandLine implements CustomCommandLine {
 	@Override
 	public Configuration applyCommandLineOptionsToConfiguration(CommandLine commandLine) throws FlinkException {
 		final Configuration resultingConfiguration = new Configuration(configuration);
-		resultingConfiguration.setString(DeploymentOptions.TARGET, StandaloneSessionClusterExecutor.NAME);
+		resultingConfiguration.setString(DeploymentOptions.TARGET, RemoteExecutor.NAME);
 
 		if (commandLine.hasOption(addressOption.getOpt())) {
 			String addressWithPort = commandLine.getOptionValue(addressOption.getOpt());
@@ -105,7 +105,7 @@ public abstract class AbstractCustomCommandLine implements CustomCommandLine {
 		formatter.printHelp(" ", options);
 	}
 
-	protected static int handleCliArgsException(CliArgsException e, Logger logger) {
+	public static int handleCliArgsException(CliArgsException e, Logger logger) {
 		logger.error("Could not parse the command line arguments.", e);
 
 		System.out.println(e.getMessage());
@@ -114,7 +114,7 @@ public abstract class AbstractCustomCommandLine implements CustomCommandLine {
 		return 1;
 	}
 
-	protected static int handleError(Throwable t, Logger logger) {
+	public static int handleError(Throwable t, Logger logger) {
 		logger.error("Error while running the Flink session.", t);
 
 		System.err.println();

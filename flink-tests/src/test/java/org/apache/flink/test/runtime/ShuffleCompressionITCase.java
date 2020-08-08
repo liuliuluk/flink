@@ -23,6 +23,7 @@ import org.apache.flink.api.common.ExecutionMode;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.client.program.MiniClusterClient;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.NettyShuffleEnvironmentOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.runtime.execution.Environment;
@@ -41,9 +42,12 @@ import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.minicluster.MiniClusterConfiguration;
 import org.apache.flink.runtime.util.EnvironmentInformation;
+import org.apache.flink.streaming.runtime.partitioner.BroadcastPartitioner;
 import org.apache.flink.types.LongValue;
 
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
@@ -52,17 +56,34 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
 /**
- * Tests pipeline/blocking shuffle when data compression is enabled.
+ * Tests network shuffle when data compression is enabled.
  */
+@RunWith(Parameterized.class)
 public class ShuffleCompressionITCase {
 
-	private static final int NUM_RECORDS_TO_SEND = 10 * 1024 * 1024;
+	private static final int NUM_BUFFERS_TO_SEND = 1000;
 
-	private static final int PARALLELISM = 2;
+	private static final int BUFFER_SIZE = 32 * 1024;
 
-	@Test
-	public void testDataCompressionForPipelineShuffle() throws Exception {
-		executeTest(createJobGraph(ScheduleMode.EAGER, ResultPartitionType.PIPELINED, ExecutionMode.PIPELINED));
+	private static final int BYTES_PER_RECORD = 12;
+
+	/** We plus 1 to guarantee that the last buffer contains no more than one record and can not be compressed. */
+	private static final int NUM_RECORDS_TO_SEND = NUM_BUFFERS_TO_SEND * BUFFER_SIZE / BYTES_PER_RECORD + 1;
+
+	private static final int NUM_TASKMANAGERS = 2;
+
+	private static final int NUM_SLOTS = 4;
+
+	private static final int PARALLELISM = NUM_TASKMANAGERS * NUM_SLOTS;
+
+	private static final LongValue RECORD_TO_SEND = new LongValue(4387942071694473832L);
+
+	@Parameterized.Parameter
+	public static boolean useBroadcastPartitioner = false;
+
+	@Parameterized.Parameters(name = "useBroadcastPartitioner = {0}")
+	public static Boolean[] params() {
+		return new Boolean[] { true, false };
 	}
 
 	@Test
@@ -72,14 +93,13 @@ public class ShuffleCompressionITCase {
 
 	private void executeTest(JobGraph jobGraph) throws Exception {
 		Configuration configuration = new Configuration();
-		configuration.setString(TaskManagerOptions.TOTAL_FLINK_MEMORY, "1g");
+		configuration.set(TaskManagerOptions.TOTAL_FLINK_MEMORY, MemorySize.parse("1g"));
 		configuration.setBoolean(NettyShuffleEnvironmentOptions.BLOCKING_SHUFFLE_COMPRESSION_ENABLED, true);
-		configuration.setBoolean(NettyShuffleEnvironmentOptions.PIPELINED_SHUFFLE_COMPRESSION_ENABLED, true);
 
 		final MiniClusterConfiguration miniClusterConfiguration = new MiniClusterConfiguration.Builder()
 			.setConfiguration(configuration)
-			.setNumTaskManagers(PARALLELISM)
-			.setNumSlotsPerTaskManager(1)
+			.setNumTaskManagers(NUM_TASKMANAGERS)
+			.setNumSlotsPerTaskManager(NUM_SLOTS)
 			.build();
 
 		try (MiniCluster miniCluster = new MiniCluster(miniClusterConfiguration)) {
@@ -110,7 +130,7 @@ public class ShuffleCompressionITCase {
 		sink.setParallelism(PARALLELISM);
 		sink.setSlotSharingGroup(slotSharingGroup);
 
-		sink.connectNewDataSetAsInput(source, DistributionPattern.POINTWISE, resultPartitionType);
+		sink.connectNewDataSetAsInput(source, DistributionPattern.ALL_TO_ALL, resultPartitionType);
 		JobGraph jobGraph = new JobGraph(source, sink);
 		jobGraph.setScheduleMode(scheduleMode);
 
@@ -138,13 +158,16 @@ public class ShuffleCompressionITCase {
 				// enable output flush for pipeline mode
 				recordWriterBuilder.setTimeout(100);
 			}
+			if (useBroadcastPartitioner) {
+				recordWriterBuilder.setChannelSelector(new BroadcastPartitioner());
+			}
 			RecordWriter<LongValue> writer = recordWriterBuilder.build(resultPartitionWriter);
 
 			for (int i = 0; i < NUM_RECORDS_TO_SEND; ++i) {
-				LongValue value = new LongValue(i);
-				writer.broadcastEmit(value);
+				writer.broadcastEmit(RECORD_TO_SEND);
 			}
 			writer.flushAll();
+			writer.clearBuffers();
 		}
 	}
 
@@ -164,9 +187,9 @@ public class ShuffleCompressionITCase {
 				new String[]{EnvironmentInformation.getTemporaryFileDirectory()});
 
 			LongValue value = new LongValue();
-			for (int i = 0; i < NUM_RECORDS_TO_SEND; ++i) {
+			for (int i = 0; i < PARALLELISM * NUM_RECORDS_TO_SEND; ++i) {
 				reader.next(value);
-				assertEquals(i, value.getValue());
+				assertEquals(RECORD_TO_SEND.getValue(), value.getValue());
 			}
 		}
 	}

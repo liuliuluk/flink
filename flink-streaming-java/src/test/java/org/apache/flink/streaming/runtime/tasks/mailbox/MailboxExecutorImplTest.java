@@ -37,7 +37,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -61,7 +60,7 @@ public class MailboxExecutorImplTest {
 		this.mailbox = new TaskMailboxImpl();
 		this.mailboxExecutor = new MailboxExecutorImpl(mailbox, DEFAULT_PRIORITY, StreamTaskActionExecutor.IMMEDIATE);
 		this.otherThreadExecutor = Executors.newSingleThreadScheduledExecutor();
-		this.mailboxProcessor = new MailboxProcessor(c -> { }, StreamTaskActionExecutor.IMMEDIATE, mailbox, mailboxExecutor);
+		this.mailboxProcessor = new MailboxProcessor(c -> { }, mailbox, StreamTaskActionExecutor.IMMEDIATE);
 	}
 
 	@After
@@ -150,18 +149,6 @@ public class MailboxExecutorImplTest {
 
 		Assert.assertNull(exceptionReference.get());
 		Assert.assertEquals(Thread.currentThread(), testRunnable.wasExecutedBy());
-	}
-
-	@Test
-	public void testPrettyExceptionMessage() {
-		final String description = "Pretty command description";
-		mailboxExecutor.execute(
-			() -> {
-				throw new RuntimeException("Some random exception");
-			},
-			description);
-		expectedException.expectMessage(containsString(description));
-		mailboxExecutor.tryYield();
 	}
 
 	/**

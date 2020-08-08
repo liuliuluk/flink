@@ -20,11 +20,12 @@ package org.apache.flink.api.scala
 
 import java.io._
 
+import org.apache.flink.annotation.Internal
 import org.apache.flink.client.cli.{CliFrontend, CliFrontendParser}
 import org.apache.flink.client.deployment.executors.RemoteExecutor
 import org.apache.flink.client.deployment.DefaultClusterClientServiceLoader
 import org.apache.flink.client.program.{ClusterClient, MiniClusterClient}
-import org.apache.flink.configuration.{Configuration, DeploymentOptions, GlobalConfiguration, JobManagerOptions, RestOptions}
+import org.apache.flink.configuration.{ConfigConstants, Configuration, DeploymentOptions, GlobalConfiguration, JobManagerOptions, RestOptions, TaskManagerOptions}
 import org.apache.flink.runtime.minicluster.{MiniCluster, MiniClusterConfiguration}
 
 import scala.collection.mutable.ArrayBuffer
@@ -132,16 +133,14 @@ object FlinkShell {
     }
   }
 
-  private def ensureYarnConfig(config: Config) = config.yarnConfig match {
+
+  @Internal def ensureYarnConfig(config: Config) = config.yarnConfig match {
     case Some(yarnConfig) => yarnConfig
     case None => YarnConfig()
   }
 
   private def getConfigDir(config: Config) = {
-    config.configDir match {
-      case Some(confDir) => confDir
-      case None => CliFrontend.getConfigurationDirectoryFromEnv
-    }
+    config.configDir.getOrElse(CliFrontend.getConfigurationDirectoryFromEnv)
   }
 
   private def getGlobalConfig(config: Config) = {
@@ -196,7 +195,7 @@ object FlinkShell {
     println(" good bye ..")
   }
 
-  private def fetchConnectionInfo(
+  @Internal def fetchConnectionInfo(
       config: Config,
       flinkConfig: Configuration): (Configuration, Option[ClusterClient[_]]) = {
 
@@ -223,15 +222,16 @@ object FlinkShell {
       case None => fetchDeployedYarnClusterInfo(config, clusterConfig, "default")
     }
 
+    println("Configuration: " + effectiveConfig)
+
     (effectiveConfig, clusterClient)
   }
 
   private def deployNewYarnCluster(config: Config, flinkConfig: Configuration) = {
     val effectiveConfig = new Configuration(flinkConfig)
-    val args = parseYarnArgList(config, "yarn-cluster")
+    val args = parseArgList(config, "yarn-cluster")
 
-    val configurationDirectory =
-      config.configDir.getOrElse(CliFrontend.getConfigurationDirectoryFromEnv)
+    val configurationDirectory = getConfigDir(config)
 
     val frontend = new CliFrontend(
       effectiveConfig,
@@ -242,7 +242,7 @@ object FlinkShell {
       frontend.getCustomCommandLineOptions)
     val commandLine = CliFrontendParser.parse(commandLineOptions, args, true)
 
-    val customCLI = frontend.getActiveCustomCommandLine(commandLine)
+    val customCLI = frontend.validateAndGetActiveCommandLine(commandLine)
     val executorConfig = customCLI.applyCommandLineOptionsToConfiguration(commandLine)
 
     val serviceLoader = new DefaultClusterClientServiceLoader
@@ -255,6 +255,7 @@ object FlinkShell {
         .deploySessionCluster(clusterSpecification)
         .getClusterClient
     } finally {
+      executorConfig.set(DeploymentOptions.TARGET, "yarn-session")
       clusterDescriptor.close()
     }
 
@@ -267,10 +268,9 @@ object FlinkShell {
       mode: String) = {
 
     val effectiveConfig = new Configuration(flinkConfig)
-    val args = parseYarnArgList(config, mode)
+    val args = parseArgList(config, mode)
 
-    val configurationDirectory =
-      config.configDir.getOrElse(CliFrontend.getConfigurationDirectoryFromEnv)
+    val configurationDirectory = getConfigDir(config)
 
     val frontend = new CliFrontend(
       effectiveConfig,
@@ -281,13 +281,13 @@ object FlinkShell {
       frontend.getCustomCommandLineOptions)
     val commandLine = CliFrontendParser.parse(commandLineOptions, args, true)
 
-    val customCLI = frontend.getActiveCustomCommandLine(commandLine)
+    val customCLI = frontend.validateAndGetActiveCommandLine(commandLine)
     val executorConfig = customCLI.applyCommandLineOptionsToConfiguration(commandLine);
 
     (executorConfig, None)
   }
 
-  def parseYarnArgList(config: Config, mode: String): Array[String] = {
+  def parseArgList(config: Config, mode: String): Array[String] = {
     val args = if (mode == "default") {
       ArrayBuffer[String]()
     } else {
@@ -340,8 +340,15 @@ object FlinkShell {
   }
 
   private def createLocalCluster(flinkConfig: Configuration) = {
+
+    val numTaskManagers = flinkConfig.getInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER,
+      ConfigConstants.DEFAULT_LOCAL_NUMBER_TASK_MANAGER)
+    val numSlotsPerTaskManager = flinkConfig.getInteger(TaskManagerOptions.NUM_TASK_SLOTS)
+
     val miniClusterConfig = new MiniClusterConfiguration.Builder()
       .setConfiguration(flinkConfig)
+      .setNumSlotsPerTaskManager(numSlotsPerTaskManager)
+      .setNumTaskManagers(numTaskManagers)
       .build()
 
     val cluster = new MiniCluster(miniClusterConfig)
