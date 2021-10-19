@@ -21,6 +21,7 @@ package org.apache.flink.runtime.checkpoint;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
@@ -45,6 +46,7 @@ import org.apache.flink.runtime.messages.checkpoint.AcknowledgeCheckpoint;
 import org.apache.flink.runtime.messages.checkpoint.DeclineCheckpoint;
 import org.apache.flink.runtime.rpc.exceptions.RpcException;
 import org.apache.flink.runtime.state.CheckpointMetadataOutputStream;
+import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointStorageAccess;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
 import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
@@ -58,8 +60,10 @@ import org.apache.flink.runtime.state.SharedStateRegistry;
 import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StreamStateHandle;
 import org.apache.flink.runtime.state.filesystem.FileStateHandle;
+import org.apache.flink.runtime.state.filesystem.FsStateBackend;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.runtime.state.memory.MemoryBackendCheckpointStorageAccess;
+import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.runtime.state.memory.NonPersistentMetadataCheckpointStorageLocation;
 import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
 import org.apache.flink.runtime.state.testutils.TestCompletedCheckpointStorageLocation;
@@ -82,6 +86,7 @@ import org.mockito.verification.VerificationMode;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -643,8 +648,7 @@ public class CheckpointCoordinatorTest extends TestLogger {
     @Test
     public void testIOExceptionForPeriodicSchedulingWithInactiveTasks() throws Exception {
         CheckpointCoordinator checkpointCoordinator =
-                setupCheckpointCoordinatorWithInactiveTasks(
-                        new TestingIOExceptionCheckpointIDCounter());
+                setupCheckpointCoordinatorWithInactiveTasks(new IOExceptionCheckpointStorage());
 
         final CompletableFuture<CompletedCheckpoint> onCompletionPromise =
                 checkpointCoordinator.triggerCheckpoint(
@@ -671,14 +675,23 @@ public class CheckpointCoordinatorTest extends TestLogger {
     /** Tests that do not trigger checkpoint when IOException occurred. */
     @Test
     public void testTriggerCheckpointAfterIOException() throws Exception {
-        testTriggerCheckpoint(new TestingIOExceptionCheckpointIDCounter(), IO_EXCEPTION);
+        // given: Checkpoint coordinator which fails on initializeLocationForCheckpoint.
+        TestFailJobCallback failureCallback = new TestFailJobCallback();
+        CheckpointCoordinator checkpointCoordinator =
+                new CheckpointCoordinatorBuilder()
+                        .setFailureManager(new CheckpointFailureManager(0, failureCallback))
+                        .setCheckpointStorage(new IOExceptionCheckpointStorage())
+                        .setTimer(manuallyTriggeredScheduledExecutor)
+                        .build();
+        // when: The checkpoint is triggered.
+        testTriggerCheckpoint(checkpointCoordinator, IO_EXCEPTION);
+
+        // then: Failure manager should fail the job.
+        assertEquals(1, failureCallback.getInvokeCounter());
     }
 
     @Test
     public void testCheckpointAbortsIfTriggerTasksAreFinishedAndIOException() throws Exception {
-        TestingIOExceptionCheckpointIDCounter idCounter =
-                new TestingIOExceptionCheckpointIDCounter();
-
         JobVertexID jobVertexID1 = new JobVertexID();
         JobVertexID jobVertexID2 = new JobVertexID();
 
@@ -692,10 +705,9 @@ public class CheckpointCoordinatorTest extends TestLogger {
         CheckpointCoordinator checkpointCoordinator =
                 new CheckpointCoordinatorBuilder()
                         .setExecutionGraph(graph)
-                        .setCheckpointIDCounter(idCounter)
+                        .setCheckpointStorage(new IOExceptionCheckpointStorage())
                         .setTimer(manuallyTriggeredScheduledExecutor)
                         .build();
-        idCounter.setOwner(checkpointCoordinator);
 
         Arrays.stream(graph.getJobVertex(jobVertexID1).getTaskVertices())
                 .forEach(task -> task.getCurrentExecutionAttempt().markFinished());
@@ -2329,7 +2341,7 @@ public class CheckpointCoordinatorTest extends TestLogger {
     @Test
     public void testPeriodicSchedulingWithInactiveTasks() throws Exception {
         CheckpointCoordinator checkpointCoordinator =
-                setupCheckpointCoordinatorWithInactiveTasks(new CheckpointIDCounterWithOwner());
+                setupCheckpointCoordinatorWithInactiveTasks(new MemoryStateBackend());
 
         // the coordinator should start checkpointing now
         manuallyTriggeredScheduledExecutor.triggerPeriodicScheduledTasks();
@@ -2339,7 +2351,7 @@ public class CheckpointCoordinatorTest extends TestLogger {
     }
 
     private CheckpointCoordinator setupCheckpointCoordinatorWithInactiveTasks(
-            CheckpointIDCounterWithOwner checkpointIDCounter) throws Exception {
+            CheckpointStorage checkpointStorage) throws Exception {
         JobVertexID jobVertexID1 = new JobVertexID();
 
         ExecutionGraph graph =
@@ -2357,11 +2369,13 @@ public class CheckpointCoordinatorTest extends TestLogger {
                         .setMinPauseBetweenCheckpoints(0) // no extra delay
                         .setMaxConcurrentCheckpoints(2) // max two concurrent checkpoints
                         .build();
+        CheckpointIDCounterWithOwner checkpointIDCounter = new CheckpointIDCounterWithOwner();
         CheckpointCoordinator checkpointCoordinator =
                 new CheckpointCoordinatorBuilder()
                         .setExecutionGraph(graph)
                         .setCheckpointCoordinatorConfiguration(chkConfig)
                         .setCompletedCheckpointStore(new StandaloneCompletedCheckpointStore(2))
+                        .setCheckpointStorage(checkpointStorage)
                         .setTimer(manuallyTriggeredScheduledExecutor)
                         .setCheckpointIDCounter(checkpointIDCounter)
                         .build();
@@ -3036,14 +3050,7 @@ public class CheckpointCoordinatorTest extends TestLogger {
     /** Tests that do not trigger checkpoint when stop the coordinator after the eager pre-check. */
     @Test
     public void testTriggerCheckpointAfterStopping() throws Exception {
-        testTriggerCheckpoint(new StoppingCheckpointIDCounter(), PERIODIC_SCHEDULER_SHUTDOWN);
-    }
-
-    private void testTriggerCheckpoint(
-            CheckpointIDCounterWithOwner testingCounter,
-            CheckpointFailureReason expectedFailureReason)
-            throws Exception {
-        // set up the coordinator
+        StoppingCheckpointIDCounter testingCounter = new StoppingCheckpointIDCounter();
         CheckpointCoordinator checkpointCoordinator =
                 new CheckpointCoordinatorBuilder()
                         .setCheckpointIDCounter(testingCounter)
@@ -3051,6 +3058,13 @@ public class CheckpointCoordinatorTest extends TestLogger {
                         .build();
         testingCounter.setOwner(checkpointCoordinator);
 
+        testTriggerCheckpoint(checkpointCoordinator, PERIODIC_SCHEDULER_SHUTDOWN);
+    }
+
+    private void testTriggerCheckpoint(
+            CheckpointCoordinator checkpointCoordinator,
+            CheckpointFailureReason expectedFailureReason)
+            throws Exception {
         try {
             // start the coordinator
             checkpointCoordinator.startCheckpointScheduler();
@@ -3608,77 +3622,29 @@ public class CheckpointCoordinatorTest extends TestLogger {
     }
 
     @Test
-    public void testNotReportRestoredCompletedCheckpointIdWithAbort() throws Exception {
+    public void testBaseLocationsNotInitialized() throws Exception {
+        File checkpointDir = tmpFolder.newFolder();
         JobVertexID jobVertexID = new JobVertexID();
         ExecutionGraph graph =
                 new CheckpointCoordinatorTestingUtils.CheckpointExecutionGraphBuilder()
                         .addJobVertex(jobVertexID)
                         .setTransitToRunning(false)
                         .build();
-
-        ExecutionVertex task = graph.getJobVertex(jobVertexID).getTaskVertices()[0];
-        AtomicLong reportedCheckpointId = new AtomicLong(Long.MIN_VALUE);
-        LogicalSlot slot =
-                new TestingLogicalSlotBuilder()
-                        .setTaskManagerGateway(
-                                new SimpleAckingTaskManagerGateway() {
-                                    @Override
-                                    public void notifyCheckpointAborted(
-                                            ExecutionAttemptID executionAttemptID,
-                                            JobID jobId,
-                                            long checkpointId,
-                                            long latestCompletedCheckpointId,
-                                            long timestamp) {
-                                        reportedCheckpointId.set(latestCompletedCheckpointId);
-                                    }
-                                })
-                        .createTestingLogicalSlot();
-        ExecutionGraphTestUtils.setVertexResource(task, slot);
-        task.getCurrentExecutionAttempt().transitionState(ExecutionState.RUNNING);
-
-        CompletedCheckpoint restoredCheckpoint =
-                new CompletedCheckpoint(
-                        graph.getJobID(),
-                        5,
-                        5,
-                        5,
-                        Collections.emptyMap(),
-                        null,
-                        CheckpointProperties.forCheckpoint(
-                                CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION),
-                        new TestCompletedCheckpointStorageLocation());
-        CompletedCheckpointStore completedCheckpointStore =
-                new StandaloneCompletedCheckpointStore(10);
-        completedCheckpointStore.addCheckpoint(
-                restoredCheckpoint, new CheckpointsCleaner(), () -> {});
-        StandaloneCheckpointIDCounter checkpointIDCounter = new StandaloneCheckpointIDCounter();
-        checkpointIDCounter.setCount(6);
-
         CheckpointCoordinator checkpointCoordinator =
                 new CheckpointCoordinatorBuilder()
                         .setExecutionGraph(graph)
-                        .setTimer(manuallyTriggeredScheduledExecutor)
-                        .setCompletedCheckpointStore(completedCheckpointStore)
-                        .setCheckpointIDCounter(checkpointIDCounter)
-                        .setAllowCheckpointsAfterTasksFinished(true)
+                        .setCheckpointCoordinatorConfiguration(
+                                CheckpointCoordinatorConfiguration.builder()
+                                        .setCheckpointInterval(Long.MAX_VALUE)
+                                        .build())
+                        .setCheckpointStorage(new FsStateBackend(checkpointDir.toURI()))
                         .build();
-        checkpointCoordinator.restoreLatestCheckpointedStateToSubtasks(
-                new HashSet<>(graph.getAllVertices().values()));
+        Path jobCheckpointPath =
+                new Path(checkpointDir.getAbsolutePath(), graph.getJobID().toString());
+        FileSystem fs = FileSystem.get(checkpointDir.toURI());
 
-        CompletableFuture<?> result = checkpointCoordinator.triggerCheckpoint(false);
-        manuallyTriggeredScheduledExecutor.triggerAll();
-        long abortedCheckpointId =
-                checkpointCoordinator.getPendingCheckpoints().entrySet().iterator().next().getKey();
-        checkpointCoordinator.receiveDeclineMessage(
-                new DeclineCheckpoint(
-                        graph.getJobID(),
-                        task.getCurrentExecutionAttempt().getAttemptId(),
-                        abortedCheckpointId,
-                        new CheckpointException(CHECKPOINT_EXPIRED)),
-                "localhost");
-        assertTrue(result.isCompletedExceptionally());
-
-        assertEquals(0, reportedCheckpointId.get());
+        // directory will not be created if checkpointing is disabled
+        Assert.assertFalse(fs.exists(jobCheckpointPath));
     }
 
     private CheckpointCoordinator getCheckpointCoordinator(ExecutionGraph graph) throws Exception {
@@ -3829,12 +3795,16 @@ public class CheckpointCoordinatorTest extends TestLogger {
         }
     }
 
-    private static class TestingIOExceptionCheckpointIDCounter
-            extends CheckpointIDCounterWithOwner {
+    private static class IOExceptionCheckpointStorage extends JobManagerCheckpointStorage {
         @Override
-        public long getAndIncrement() throws Exception {
-            checkNotNull(owner);
-            throw new IOException("disk is error!");
+        public CheckpointStorageAccess createCheckpointStorage(JobID jobId) throws IOException {
+            return new MemoryBackendCheckpointStorageAccess(jobId, null, null, 100) {
+                @Override
+                public CheckpointStorageLocation initializeLocationForCheckpoint(long checkpointId)
+                        throws IOException {
+                    throw new IOException("disk is error!");
+                }
+            };
         }
     }
 

@@ -32,6 +32,7 @@ import org.apache.flink.runtime.checkpoint.CheckpointFailureReason;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointMetricsBuilder;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.CheckpointType;
 import org.apache.flink.runtime.checkpoint.channel.ChannelStateWriter;
 import org.apache.flink.runtime.checkpoint.channel.InputChannelInfo;
 import org.apache.flink.runtime.checkpoint.channel.SequentialChannelStateReader;
@@ -65,6 +66,7 @@ import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.state.StateBackendLoader;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
 import org.apache.flink.runtime.taskmanager.DispatcherThreadFactory;
+import org.apache.flink.runtime.taskmanager.Task;
 import org.apache.flink.runtime.throughput.ThroughputCalculator;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions;
@@ -111,6 +113,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -284,7 +287,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
     private long latestAsyncCheckpointStartDelayNanos;
 
-    private final CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
     private volatile boolean endOfDataReceived = false;
 
     private final ThroughputCalculator throughputCalculator;
@@ -295,7 +297,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
     private final Environment environment;
 
-    private volatile boolean shouldInterruptOnCancel = true;
+    private final Object shouldInterruptOnCancelLock = new Object();
+
+    @GuardedBy("shouldInterruptOnCancelLock")
+    private boolean shouldInterruptOnCancel = true;
 
     // ------------------------------------------------------------------------
 
@@ -529,6 +534,15 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
     }
 
     protected void endData() throws Exception {
+
+        if (syncSavepointWithoutDrain != null && areCheckpointsWithFinishedTasksEnabled()) {
+            throw new FlinkRuntimeException(
+                    "We run out of data to process while waiting for a synchronous savepoint"
+                            + " to be finished. This can lead to a deadlock waiting for a final"
+                            + " checkpoint after a synchronous savepoint, which will never be"
+                            + " triggered.");
+        }
+
         advanceToEndOfEventTime();
         // finish all operators in a chain effect way
         operatorChain.finishOperators(actionExecutor);
@@ -648,10 +662,15 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
         LOG.debug("Initializing {}.", getName());
 
         operatorChain =
-                getEnvironment().getTaskStateManager().isFinishedOnRestore()
+                getEnvironment().getTaskStateManager().isTaskDeployedAsFinished()
                         ? new FinishedOperatorChain<>(this, recordWriter)
                         : new RegularOperatorChain<>(this, recordWriter);
         mainOperator = operatorChain.getMainOperator();
+
+        getEnvironment()
+                .getTaskStateManager()
+                .getRestoreCheckpointId()
+                .ifPresent(restoreId -> latestReportCheckpointId = restoreId);
 
         // task specific initialization
         init();
@@ -854,6 +873,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
             LOG.debug("All pending checkpoints are finished");
         }
 
+        disableInterruptOnCancel();
+
         // make an attempt to dispose the operators such that failures in the dispose call
         // still let the computation fail
         closeAllOperators();
@@ -878,16 +899,13 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
         Exception suppressedException =
                 throwable == null ? null : runAndSuppressThrowable(this::cancelTask, null);
 
+        disableInterruptOnCancel();
+
+        // note: This `.join()` is already uninterruptible, so it doesn't matter if we have already
+        // disabled the interruptions or not.
         getCompletionFuture().exceptionally(unused -> null).join();
         // clean up everything we initialized
         isRunning = false;
-
-        // Now that we are outside the user code, we do not want to be interrupted further
-        // upon cancellation. The shutdown logic below needs to make sure it does not issue calls
-        // that block and stall shutdown.
-        // Additionally, the cancellation watch dog will issue a hard-cancel (kill the TaskManager
-        // process) as a backup in case some shutdown procedure blocks outside our control.
-        shouldInterruptOnCancel = false;
 
         // clear any previously issued interrupt for a more graceful shutdown
         Thread.interrupted();
@@ -916,10 +934,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
         suppressedException = runAndSuppressThrowable(mailboxProcessor::close, suppressedException);
 
-        if (suppressedException == null) {
-            terminationFuture.complete(null);
-        } else {
-            terminationFuture.completeExceptionally(suppressedException);
+        if (suppressedException != null) {
             throw suppressedException;
         }
     }
@@ -935,7 +950,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
     }
 
     @Override
-    public final Future<Void> cancel() throws Exception {
+    public final void cancel() throws Exception {
         isRunning = false;
         canceled = true;
 
@@ -959,7 +974,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                                 }
                             });
         }
-        return terminationFuture;
     }
 
     public MailboxExecutorFactory getMailboxExecutorFactory() {
@@ -1276,19 +1290,28 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
             CheckpointMetricsBuilder checkpointMetrics)
             throws Exception {
 
+        final CheckpointType checkpointType = checkpointOptions.getCheckpointType();
         LOG.debug(
                 "Starting checkpoint {} {} on task {}",
                 checkpointMetaData.getCheckpointId(),
-                checkpointOptions.getCheckpointType(),
+                checkpointType,
                 getName());
+
+        if (checkpointType.isSynchronous()
+                && !checkpointType.shouldDrain()
+                && endOfDataReceived
+                && areCheckpointsWithFinishedTasksEnabled()) {
+            LOG.debug("Can not trigger a stop-with-savepoint w/o drain if a task is finishing.");
+            return false;
+        }
 
         if (isRunning) {
             actionExecutor.runThrowing(
                     () -> {
-                        if (checkpointOptions.getCheckpointType().isSynchronous()) {
+                        if (checkpointType.isSynchronous()) {
                             setSynchronousSavepoint(
                                     checkpointMetaData.getCheckpointId(),
-                                    checkpointOptions.getCheckpointType().shouldDrain());
+                                    checkpointType.shouldDrain());
                         }
 
                         if (areCheckpointsWithFinishedTasksEnabled()
@@ -1590,7 +1613,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                             edge,
                             i,
                             environment,
-                            environment.getTaskInfo().getTaskName(),
+                            environment.getTaskInfo().getTaskNameWithSubtasks(),
                             edge.getBufferTimeout()));
         }
         return recordWriters;
@@ -1601,7 +1624,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
             StreamEdge edge,
             int outputIndex,
             Environment environment,
-            String taskName,
+            String taskNameWithSubtask,
             long bufferTimeout) {
 
         StreamPartitioner<OUT> outputPartitioner = null;
@@ -1621,7 +1644,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                 "Using partitioner {} for output {} of task {}",
                 outputPartitioner,
                 outputIndex,
-                taskName);
+                taskNameWithSubtask);
 
         ResultPartitionWriter bufferWriter = environment.getWriter(outputIndex);
 
@@ -1637,7 +1660,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
                 new RecordWriterBuilder<SerializationDelegate<StreamRecord<OUT>>>()
                         .setChannelSelector(outputPartitioner)
                         .setTimeout(bufferTimeout)
-                        .setTaskName(taskName)
+                        .setTaskName(taskNameWithSubtask)
                         .build(bufferWriter);
         output.setMetricGroup(environment.getMetricGroup().getIOMetricGroup());
         return output;
@@ -1723,9 +1746,31 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
         return true;
     }
 
+    /**
+     * While we are outside the user code, we do not want to be interrupted further upon
+     * cancellation. The shutdown logic below needs to make sure it does not issue calls that block
+     * and stall shutdown. Additionally, the cancellation watch dog will issue a hard-cancel (kill
+     * the TaskManager process) as a backup in case some shutdown procedure blocks outside our
+     * control.
+     */
+    private void disableInterruptOnCancel() {
+        synchronized (shouldInterruptOnCancelLock) {
+            shouldInterruptOnCancel = false;
+        }
+    }
+
     @Override
-    public boolean shouldInterruptOnCancel() {
-        return shouldInterruptOnCancel;
+    public void maybeInterruptOnCancel(
+            Thread toInterrupt, @Nullable String taskName, @Nullable Long timeout) {
+        synchronized (shouldInterruptOnCancelLock) {
+            if (shouldInterruptOnCancel) {
+                if (taskName != null && timeout != null) {
+                    Task.logTaskThreadStackTrace(toInterrupt, taskName, timeout, "interrupting");
+                }
+
+                toInterrupt.interrupt();
+            }
+        }
     }
 
     @Override

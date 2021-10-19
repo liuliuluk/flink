@@ -188,10 +188,6 @@ public class CheckpointCoordinator {
      */
     private long lastCheckpointCompletionRelativeTime;
 
-    /** The id of the latest completed checkpoint. */
-    @GuardedBy("lock")
-    private long latestCompletedCheckpointId;
-
     /**
      * Flag whether a triggered checkpoint should immediately schedule the next checkpoint.
      * Non-volatile, because only accessed in synchronized scope
@@ -227,6 +223,8 @@ public class CheckpointCoordinator {
     private final CheckpointPlanCalculator checkpointPlanCalculator;
 
     private final ExecutionAttemptMappingProvider attemptMappingProvider;
+
+    private boolean baseLocationsForCheckpointInitialized = false;
 
     // --------------------------------------------------------------------------------------------
 
@@ -327,7 +325,11 @@ public class CheckpointCoordinator {
 
         try {
             this.checkpointStorageView = checkpointStorage.createCheckpointStorage(job);
-            checkpointStorageView.initializeBaseLocations();
+
+            if (isPeriodicCheckpointingConfigured()) {
+                checkpointStorageView.initializeBaseLocationsForCheckpoint();
+                baseLocationsForCheckpointInitialized = true;
+            }
         } catch (IOException e) {
             throw new FlinkRuntimeException(
                     "Failed to create checkpoint storage at checkpoint coordinator side.", e);
@@ -540,6 +542,9 @@ public class CheckpointCoordinator {
             CompletableFuture<CheckpointPlan> checkpointPlanFuture =
                     checkpointPlanCalculator.calculateCheckpointPlan();
 
+            boolean initializeBaseLocations = !baseLocationsForCheckpointInitialized;
+            baseLocationsForCheckpointInitialized = true;
+
             final CompletableFuture<PendingCheckpoint> pendingCheckpointCompletableFuture =
                     checkpointPlanFuture
                             .thenApplyAsync(
@@ -549,7 +554,8 @@ public class CheckpointCoordinator {
                                                     checkpointIdAndStorageLocation =
                                                             initializeCheckpoint(
                                                                     request.props,
-                                                                    request.externalSavepointLocation);
+                                                                    request.externalSavepointLocation,
+                                                                    initializeBaseLocations);
                                             return new Tuple2<>(
                                                     plan, checkpointIdAndStorageLocation);
                                         } catch (Throwable e) {
@@ -654,6 +660,12 @@ public class CheckpointCoordinator {
             triggerTasks(request, timestamp, checkpoint)
                     .exceptionally(
                             failure -> {
+                                LOG.info(
+                                        "Triggering Checkpoint {} for job {} failed due to {}",
+                                        checkpoint.getCheckpointID(),
+                                        job,
+                                        failure);
+
                                 final CheckpointException cause;
                                 if (failure instanceof CheckpointException) {
                                     cause = (CheckpointException) failure;
@@ -720,7 +732,9 @@ public class CheckpointCoordinator {
      * @return the initialized result, checkpoint id and checkpoint location
      */
     private CheckpointIdAndStorageLocation initializeCheckpoint(
-            CheckpointProperties props, @Nullable String externalSavepointLocation)
+            CheckpointProperties props,
+            @Nullable String externalSavepointLocation,
+            boolean initializeBaseLocations)
             throws Exception {
 
         // this must happen outside the coordinator-wide lock, because it
@@ -728,11 +742,18 @@ public class CheckpointCoordinator {
         // with external services (in HA mode) and may block for a while.
         long checkpointID = checkpointIdCounter.getAndIncrement();
 
-        CheckpointStorageLocation checkpointStorageLocation =
-                props.isSavepoint()
-                        ? checkpointStorageView.initializeLocationForSavepoint(
-                                checkpointID, externalSavepointLocation)
-                        : checkpointStorageView.initializeLocationForCheckpoint(checkpointID);
+        final CheckpointStorageLocation checkpointStorageLocation;
+        if (props.isSavepoint()) {
+            checkpointStorageLocation =
+                    checkpointStorageView.initializeLocationForSavepoint(
+                            checkpointID, externalSavepointLocation);
+        } else {
+            if (initializeBaseLocations) {
+                checkpointStorageView.initializeBaseLocationsForCheckpoint();
+            }
+            checkpointStorageLocation =
+                    checkpointStorageView.initializeLocationForCheckpoint(checkpointID);
+        }
 
         return new CheckpointIdAndStorageLocation(checkpointID, checkpointStorageLocation);
     }
@@ -864,7 +885,13 @@ public class CheckpointCoordinator {
                 getCheckpointException(
                         CheckpointFailureReason.TRIGGER_CHECKPOINT_FAILURE, throwable);
         onCompletionPromise.completeExceptionally(checkpointException);
-        onTriggerFailure((PendingCheckpoint) null, checkpointException);
+        onTriggerFailure((PendingCheckpoint) null, onCompletionPromise.props, checkpointException);
+    }
+
+    private void onTriggerFailure(PendingCheckpoint checkpoint, Throwable throwable) {
+        checkArgument(checkpoint != null, "Pending checkpoint can not be null.");
+
+        onTriggerFailure(checkpoint, checkpoint.getProps(), throwable);
     }
 
     /**
@@ -874,13 +901,20 @@ public class CheckpointCoordinator {
      *     prematurely without a proper initialization.
      * @param throwable the reason of trigger failure
      */
-    private void onTriggerFailure(@Nullable PendingCheckpoint checkpoint, Throwable throwable) {
+    private void onTriggerFailure(
+            @Nullable PendingCheckpoint checkpoint,
+            CheckpointProperties checkpointProperties,
+            Throwable throwable) {
         // beautify the stack trace a bit
         throwable = ExceptionUtils.stripCompletionException(throwable);
 
         try {
             coordinatorsToCheckpoint.forEach(
                     OperatorCoordinatorCheckpointContext::abortCurrentTriggering);
+
+            final CheckpointException cause =
+                    getCheckpointException(
+                            CheckpointFailureReason.TRIGGER_CHECKPOINT_FAILURE, throwable);
 
             if (checkpoint != null && !checkpoint.isDisposed()) {
                 int numUnsuccessful = numUnsuccessfulCheckpointsTriggers.incrementAndGet();
@@ -890,17 +924,18 @@ public class CheckpointCoordinator {
                         job,
                         numUnsuccessful,
                         throwable);
-                final CheckpointException cause =
-                        getCheckpointException(
-                                CheckpointFailureReason.TRIGGER_CHECKPOINT_FAILURE, throwable);
+
                 synchronized (lock) {
                     abortPendingCheckpoint(checkpoint, cause);
                 }
             } else {
                 LOG.info(
-                        "Failed to trigger checkpoint for job {} since {}",
+                        "Failed to trigger checkpoint for job {} because {}",
                         job,
                         throwable.getMessage());
+
+                failureManager.handleCheckpointException(
+                        checkpoint, checkpointProperties, cause, null);
             }
         } finally {
             isTriggering = false;
@@ -1181,8 +1216,6 @@ public class CheckpointCoordinator {
      */
     private void completePendingCheckpoint(PendingCheckpoint pendingCheckpoint)
             throws CheckpointException {
-        assert Thread.holdsLock(lock);
-
         final long checkpointId = pendingCheckpoint.getCheckpointId();
         final CompletedCheckpoint completedCheckpoint;
 
@@ -1242,10 +1275,6 @@ public class CheckpointCoordinator {
                         "Could not complete the pending checkpoint " + checkpointId + '.',
                         CheckpointFailureReason.FINALIZE_CHECKPOINT_FAILURE,
                         exception);
-            }
-
-            if (checkpointId > latestCompletedCheckpointId) {
-                latestCompletedCheckpointId = checkpointId;
             }
         } finally {
             pendingCheckpoints.remove(checkpointId);
@@ -1319,8 +1348,8 @@ public class CheckpointCoordinator {
     private void sendAbortedMessages(
             List<ExecutionVertex> tasksToAbort, long checkpointId, long timeStamp) {
         assert (Thread.holdsLock(lock));
+        long latestCompletedCheckpointId = completedCheckpointStore.getLatestCheckpointId();
 
-        final long currentLatestCompletedCheckpointId = latestCompletedCheckpointId;
         // send notification of aborted checkpoints asynchronously.
         executor.execute(
                 () -> {
@@ -1329,7 +1358,7 @@ public class CheckpointCoordinator {
                         Execution ee = ev.getCurrentExecutionAttempt();
                         if (ee != null) {
                             ee.notifyCheckpointAborted(
-                                    checkpointId, currentLatestCompletedCheckpointId, timeStamp);
+                                    checkpointId, latestCompletedCheckpointId, timeStamp);
                         }
                     }
                 });
@@ -1934,16 +1963,11 @@ public class CheckpointCoordinator {
                         executor,
                         getStatsCallback(pendingCheckpoint));
 
-                if (pendingCheckpoint.getProps().isSavepoint()
-                        && pendingCheckpoint.getProps().isSynchronous()) {
-                    failureManager.handleSynchronousSavepointFailure(exception);
-                } else if (executionAttemptID != null) {
-                    failureManager.handleTaskLevelCheckpointException(
-                            exception, pendingCheckpoint.getCheckpointId(), executionAttemptID);
-                } else {
-                    failureManager.handleJobLevelCheckpointException(
-                            exception, pendingCheckpoint.getCheckpointId());
-                }
+                failureManager.handleCheckpointException(
+                        pendingCheckpoint,
+                        pendingCheckpoint.getProps(),
+                        exception,
+                        executionAttemptID);
             } finally {
                 sendAbortedMessages(
                         pendingCheckpoint.getCheckpointPlan().getTasksToCommitTo(),

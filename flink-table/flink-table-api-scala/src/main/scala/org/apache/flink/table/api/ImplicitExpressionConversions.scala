@@ -727,6 +727,28 @@ trait ImplicitExpressionConversions {
   }
 
   /**
+   * Returns the first argument that is not NULL.
+   *
+   * If all arguments are NULL, it returns NULL as well. The return type is the least
+   * restrictive, common type of all of its arguments. The return type is nullable if all
+   * arguments are nullable as well.
+   *
+   * Examples:
+   * {{{
+   * // Returns "default"
+   * coalesce(null, "default")
+   *
+   * // Returns the first non-null value among f0 and f1, or "default" if f0 and f1 are both null
+   * coalesce($"f0", $"f1", "default")
+   * }}}
+   *
+   * @param args the input expressions.
+   */
+  def coalesce(args: Expression*): Expression = {
+    Expressions.coalesce(args: _*)
+  }
+
+  /**
     * Creates an expression that selects a range of columns. It can be used wherever an array of
     * expression is accepted such as function calls, projections, or groupings.
     *
@@ -784,4 +806,76 @@ trait ImplicitExpressionConversions {
    * }}}
    */
   def not(expression: Expression): Expression = Expressions.not(expression)
+
+  /**
+   * Builds a JSON object string from a list of key-value pairs.
+   *
+   * `keyValues` is an even-numbered list of alternating key/value pairs. Note that keys must be
+   * string literals, values may be arbitrary expressions.
+   *
+   * This function returns a JSON string. The [[JsonOnNull onNull]] behavior defines how to treat
+   * `NULL` values.
+   *
+   * Values which are created from another JSON construction function call
+   * (`jsonObject`, `jsonArray`) are inserted directly rather than as a string. This allows
+   * building nested JSON structures.
+   *
+   * Examples:
+   * {{{
+   * // {}
+   * jsonObject(JsonOnNull.NULL)
+   * // {"K1":"V1","K2":"V2"}
+   * jsonObject(JsonOnNull.NULL, "K1", "V1", "K2", "V2")
+   *
+   * // Expressions as values
+   * jsonObject(JsonOnNull.NULL, "orderNo", $("orderId"))
+   *
+   * // ON NULL
+   * jsonObject(JsonOnNull.NULL, "K1", nullOf(DataTypes.STRING()))   // "{\"K1\":null}"
+   * jsonObject(JsonOnNull.ABSENT, "K1", nullOf(DataTypes.STRING())) // '{}'
+   *
+   * // {"K1":{"K2":"V"}}
+   * jsonObject(JsonOnNull.NULL, "K1", jsonObject(JsonOnNull.NULL, "K2", "V"))
+   * }}}
+   *
+   * @see #jsonObject
+   */
+  def jsonObject(onNull: JsonOnNull, keyValues: Expression*): Expression = {
+    Expressions.jsonObject(onNull, keyValues: _*)
+  }
+
+  /**
+   * Builds a JSON array string from a list of values.
+   *
+   * This function returns a JSON string. The values can be arbitrary expressions. The
+   * [[JsonOnNull onNull]] behavior defines how to treat `NULL` values.
+   *
+   * Elements which are created from another JSON construction function call
+   * (`jsonObject`, `jsonArray`) are inserted directly rather than as a string. This allows
+   * building nested JSON structures.
+   *
+   * Examples:
+   *
+   * {{{
+   * // "[]"
+   * jsonArray(JsonOnNull.NULL)
+   * // "[1,\"2\"]"
+   * jsonArray(JsonOnNull.NULL, 1, "2")
+   *
+   * // Expressions as values
+   * jsonArray(JsonOnNull.NULL, $("orderId"))
+   *
+   * // ON NULL
+   * jsonArray(JsonOnNull.NULL, nullOf(DataTypes.STRING()))   // "[null]"
+   * jsonArray(JsonOnNull.ABSENT, nullOf(DataTypes.STRING())) // "[]"
+   *
+   * // "[[1]]"
+   * jsonArray(JsonOnNull.NULL, jsonArray(JsonOnNull.NULL, 1))
+   * }}}
+   *
+   * @see #jsonObject
+   */
+  def jsonArray(onNull: JsonOnNull, values: Expression*): Expression = {
+    Expressions.jsonArray(onNull, values: _*)
+  }
 }

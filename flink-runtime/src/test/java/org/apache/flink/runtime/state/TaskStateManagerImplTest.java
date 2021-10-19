@@ -281,7 +281,29 @@ public class TaskStateManagerImplTest extends TestLogger {
                         null,
                         jobManagerTaskRestore,
                         new TestCheckpointResponder());
-        Assert.assertTrue(stateManager.isFinishedOnRestore());
+        Assert.assertTrue(stateManager.isTaskDeployedAsFinished());
+    }
+
+    public void testAcquringRestoreCheckpointId() {
+        TaskStateManagerImpl emptyStateManager =
+                new TaskStateManagerImpl(
+                        new JobID(),
+                        new ExecutionAttemptID(),
+                        new TestTaskLocalStateStore(),
+                        null,
+                        null,
+                        new TestCheckpointResponder());
+        Assert.assertFalse(emptyStateManager.getRestoreCheckpointId().isPresent());
+
+        TaskStateManagerImpl nonEmptyStateManager =
+                new TaskStateManagerImpl(
+                        new JobID(),
+                        new ExecutionAttemptID(),
+                        new TestTaskLocalStateStore(),
+                        null,
+                        new JobManagerTaskRestore(2, new TaskStateSnapshot()),
+                        new TestCheckpointResponder());
+        Assert.assertEquals(2L, (long) nonEmptyStateManager.getRestoreCheckpointId().get());
     }
 
     public static TaskStateManager taskStateManager(

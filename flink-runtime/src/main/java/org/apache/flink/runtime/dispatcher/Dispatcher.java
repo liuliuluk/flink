@@ -48,6 +48,7 @@ import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.jobmaster.factories.DefaultJobManagerJobMetricGroupFactory;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.messages.FlinkJobNotFoundException;
+import org.apache.flink.runtime.messages.FlinkJobTerminatedWithoutCancellationException;
 import org.apache.flink.runtime.messages.webmonitor.ClusterOverview;
 import org.apache.flink.runtime.messages.webmonitor.JobDetails;
 import org.apache.flink.runtime.messages.webmonitor.JobsOverview;
@@ -526,13 +527,24 @@ public abstract class Dispatcher extends PermanentlyFencedRpcEndpoint<Dispatcher
     @Override
     public CompletableFuture<Acknowledge> cancelJob(JobID jobId, Time timeout) {
         Optional<JobManagerRunner> maybeJob = getJobManagerRunner(jobId);
-        return maybeJob.map(job -> job.cancel(timeout))
-                .orElseGet(
-                        () -> {
-                            log.debug("Dispatcher is unable to cancel job {}: not found", jobId);
-                            return FutureUtils.completedExceptionally(
-                                    new FlinkJobNotFoundException(jobId));
-                        });
+
+        if (maybeJob.isPresent()) {
+            return maybeJob.get().cancel(timeout);
+        }
+
+        final ExecutionGraphInfo executionGraphInfo = executionGraphInfoStore.get(jobId);
+        if (executionGraphInfo != null) {
+            final JobStatus jobStatus = executionGraphInfo.getArchivedExecutionGraph().getState();
+            if (jobStatus == JobStatus.CANCELED) {
+                return CompletableFuture.completedFuture(Acknowledge.get());
+            } else {
+                return FutureUtils.completedExceptionally(
+                        new FlinkJobTerminatedWithoutCancellationException(jobId, jobStatus));
+            }
+        }
+
+        log.debug("Dispatcher is unable to cancel job {}: not found", jobId);
+        return FutureUtils.completedExceptionally(new FlinkJobNotFoundException(jobId));
     }
 
     @Override
@@ -675,6 +687,12 @@ public abstract class Dispatcher extends PermanentlyFencedRpcEndpoint<Dispatcher
     @Override
     public CompletableFuture<Integer> getBlobServerPort(Time timeout) {
         return CompletableFuture.completedFuture(blobServer.getPort());
+    }
+
+    @Override
+    public CompletableFuture<String> triggerCheckpoint(JobID jobID, Time timeout) {
+        return performOperationOnJobMasterGateway(
+                jobID, gateway -> gateway.triggerCheckpoint(timeout));
     }
 
     @Override
@@ -843,28 +861,36 @@ public abstract class Dispatcher extends PermanentlyFencedRpcEndpoint<Dispatcher
     protected CleanupJobState jobReachedTerminalState(ExecutionGraphInfo executionGraphInfo) {
         final ArchivedExecutionGraph archivedExecutionGraph =
                 executionGraphInfo.getArchivedExecutionGraph();
+        final JobStatus terminalJobStatus = archivedExecutionGraph.getState();
         Preconditions.checkArgument(
-                archivedExecutionGraph.getState().isTerminalState(),
+                terminalJobStatus.isTerminalState(),
                 "Job %s is in state %s which is not terminal.",
                 archivedExecutionGraph.getJobID(),
-                archivedExecutionGraph.getState());
+                terminalJobStatus);
 
-        if (archivedExecutionGraph.getFailureInfo() != null) {
+        // the failureInfo contains the reason for why job was failed/suspended, but for
+        // finished/canceled jobs it may contain the last cause of a restart (if there were any)
+        // for finished/canceled jobs we don't want to print it because it is misleading
+        final boolean isFailureInfoRelatedToJobTermination =
+                terminalJobStatus == JobStatus.SUSPENDED || terminalJobStatus == JobStatus.FAILED;
+
+        if (archivedExecutionGraph.getFailureInfo() != null
+                && isFailureInfoRelatedToJobTermination) {
             log.info(
                     "Job {} reached terminal state {}.\n{}",
                     archivedExecutionGraph.getJobID(),
-                    archivedExecutionGraph.getState(),
+                    terminalJobStatus,
                     archivedExecutionGraph.getFailureInfo().getExceptionAsString().trim());
         } else {
             log.info(
                     "Job {} reached terminal state {}.",
                     archivedExecutionGraph.getJobID(),
-                    archivedExecutionGraph.getState());
+                    terminalJobStatus);
         }
 
         archiveExecutionGraph(executionGraphInfo);
 
-        return archivedExecutionGraph.getState().isGloballyTerminalState()
+        return terminalJobStatus.isGloballyTerminalState()
                 ? CleanupJobState.GLOBAL
                 : CleanupJobState.LOCAL;
     }

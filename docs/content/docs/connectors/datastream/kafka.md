@@ -1,6 +1,6 @@
 ---
 title: Kafka
-weight: 2
+weight: 3
 type: docs
 aliases:
   - /dev/connectors/kafka.html
@@ -37,10 +37,6 @@ Modern Kafka clients are backwards compatible with broker versions 0.10.0 or lat
 For details on Kafka compatibility, please refer to the official [Kafka documentation](https://kafka.apache.org/protocol.html#protocol_compatibility).
 
 {{< artifact flink-connector-kafka withScalaVersion >}}
-
-if you are using Kafka source, ```flink-connector-base``` is also required as dependency:
-
-{{< artifact flink-connector-base >}}
 
 Flink's streaming connectors are not currently part of the binary distribution.
 See how to link with them for cluster execution [here]({{< ref "docs/dev/datastream/project-configuration" >}}).
@@ -93,7 +89,7 @@ Kafka source provide 3 ways of topic-partition subscription:
   ```
 ### Deserializer
 A deserializer is required for parsing Kafka messages. Deserializer (Deserialization schema) can be
-configured by ```setDeserializer(KakfaRecordDeserializationSchema)```, where
+configured by ```setDeserializer(KafkaRecordDeserializationSchema)```, where
 ```KafkaRecordDeserializationSchema``` defines how to deserialize a Kafka ```ConsumerRecord```.
 
 If only the value of Kafka ```ConsumerRecord``` is needed, you can use
@@ -154,6 +150,7 @@ KafkaSource has following options for configuration:
   below for more details.
 - ```register.consumer.metrics``` specifies whether to register metrics of KafkaConsumer in Flink
 metric group
+- ```commit.offsets.on.checkpoint``` specifies whether to commit consuming offsets to Kafka brokers on checkpoint
 
 For configurations of KafkaConsumer, you can refer to
 <a href="http://kafka.apache.org/documentation/#consumerconfigs">Apache Kafka documentation</a>
@@ -542,5 +539,12 @@ This is a retriable exception, so Flink job should be able to restart and resume
 It also can be circumvented by changing `retries` property in the producer settings.
 However this might cause reordering of messages,
 which in turn if undesired can be circumvented by setting `max.in.flight.requests.per.connection` to 1.
+
+### ProducerFencedException
+
+The reason for this exception is most likely a transaction timeout on the broker side. With the implementation of
+[KAFKA-6119](https://issues.apache.org/jira/browse/KAFKA-6119), the `(producerId, epoch)` will be fenced off
+after a transaction timeout and all of its pending transactions are aborted (each `transactional.id` is
+mapped to a single `producerId`; this is described in more detail in the following [blog post](https://www.confluent.io/blog/simplified-robust-exactly-one-semantics-in-kafka-2-5/)).
 
 {{< top >}}
